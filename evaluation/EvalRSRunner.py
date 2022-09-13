@@ -16,11 +16,14 @@ import time
 import numpy as np
 import json
 from reclist.abstractions import RecList
+from tqdm import tqdm
+
 from evaluation.EvalRSRecList import EvalRSRecList, EvalRSDataset
 from collections import defaultdict
 from evaluation.utils import download_with_progress, get_cache_directory, LFM_DATASET_PATH, decompress_zipfile, \
     upload_submission, TOP_K_CHALLENGE, LEADERBOARD_TESTS
 import requests
+
 
 class ChallengeDataset:
 
@@ -66,6 +69,16 @@ class ChallengeDataset:
         self._random_state = int(time.time()) if not seed else seed
         self._train_set, self._test_set = self._generate_folds(self.num_folds, self._random_state)
 
+        ## 添加预计算
+        self.train_set_cache = [
+            self._get_train_set_old(i)
+            for i in range(self.num_folds)
+        ]
+        self.test_set_cache = [
+            self._get_test_set_old(i)
+            for i in range(self.num_folds)
+        ]
+
         print("Generating dataset hashes.")
         self._events_hash = hashlib.sha256(pd.util.hash_pandas_object(self.df_events.sample(n=1000,
                                                                                             random_state=0)).values
@@ -78,8 +91,7 @@ class ChallengeDataset:
                                                                                           random_state=0)).values
                                           ).hexdigest()
 
-
-    def _get_vertice_count(self, df, column_name:str):
+    def _get_vertice_count(self, df, column_name: str):
         df = df.copy()
         df['counts'] = 1
         counts = df.groupby(column_name, as_index=True)[['counts']].sum()
@@ -93,11 +105,11 @@ class ChallengeDataset:
         valid_tracks = df_user_track['track_id'].unique()
         while delta and iter < max_iter:
             track_counts = self._get_vertice_count(df_user_track, 'track_id')
-            valid_tracks = track_counts[track_counts['counts']>=k].index
+            valid_tracks = track_counts[track_counts['counts'] >= k].index
             # keep only valid tracks
             df_user_track = df_user_track[df_user_track['track_id'].isin(valid_tracks)]
             user_counts = self._get_vertice_count(df_user_track, 'user_id')
-            valid_users = user_counts[user_counts['counts']>=k].index
+            valid_users = user_counts[user_counts['counts'] >= k].index
             # keep only valid users
             df_user_track = df_user_track[df_user_track['user_id'].isin(valid_users)]
 
@@ -108,7 +120,7 @@ class ChallengeDataset:
 
             num_users_prev = num_users
             num_tracks_prev = num_tracks
-            iter+=1
+            iter += 1
 
             # # DEBUG
             # print("ITER {}".format(iter))
@@ -119,7 +131,7 @@ class ChallengeDataset:
 
     def _generate_folds(self, num_folds: int, seed: int, frac=0.25) -> (pd.DataFrame, pd.DataFrame):
 
-        fold_ids = [(self.unique_user_ids_df.sample(frac=frac, random_state=seed+_)
+        fold_ids = [(self.unique_user_ids_df.sample(frac=frac, random_state=seed + _)
                      .reset_index(drop=True)
                      .rename({'user_id': _}, axis=1)) for _ in range(num_folds)]
         # in theory all users should have at least 10 interactions
@@ -127,10 +139,10 @@ class ChallengeDataset:
 
         test_dfs = []
         train_dfs_idx = []
-        for fold in range(num_folds):
+        for fold in tqdm(range(num_folds), desc='folds', ncols=100):
             df_fold_events = self.df_events[self.df_events['user_id'].isin(df_fold_user_ids[fold])]
             # perform k-core filter; threshold of 10
-            valid_user_ids, valid_track_ids = self._k_core_filter(df_fold_events[['user_id','track_id']], k=10)
+            valid_user_ids, valid_track_ids = self._k_core_filter(df_fold_events[['user_id', 'track_id']], k=10)
 
             df_fold_events = df_fold_events[df_fold_events['user_id'].isin(valid_user_ids)]
             df_fold_events = df_fold_events[df_fold_events['track_id'].isin(valid_track_ids)]
@@ -159,16 +171,19 @@ class ChallengeDataset:
         # print('====')
         return df_train, df_test
 
-    def _get_train_set(self, fold: int) -> pd.DataFrame:
+    def _get_train_set_old(self, fold: int) -> pd.DataFrame:
         assert fold <= self._test_set['fold'].max()
-        train_index =self._train_set[self._train_set['fold']==fold]['index']
+        train_index = self._train_set[self._train_set['fold'] == fold]['index']
         # test_index = self._test_set[self._test_set['fold']==fold].index
         # fold_users = self._fold_ids[self._fold_ids['fold']==fold]['user_id']
         # train_fold = (self.df_events.loc[self.df_events['user_id'].isin(fold_users)])
 
         return self.df_events.loc[train_index]
 
-    def _get_test_set(self, fold: int, limit: int = None, seed: int =0) -> pd.DataFrame:
+    def _get_train_set(self, fold: int) -> pd.DataFrame:
+        return self.train_set_cache[fold]
+
+    def _get_test_set_old(self, fold: int, limit: int = None, seed: int = 0) -> pd.DataFrame:
         subset_of_cols_to_return = ['user_id', 'track_id']
 
         assert fold <= self._test_set['fold'].max()
@@ -177,6 +192,10 @@ class ChallengeDataset:
             return test_set.sample(n=limit, random_state=seed)
         else:
             return test_set
+
+    def _get_test_set(self, fold: int, limit: int = None, seed: int = 0) -> pd.DataFrame:
+        assert not limit
+        return self.test_set_cache[fold]
 
     def get_sample_train_test(self):
         return self._get_train_set(1), self._get_test_set(1)
@@ -224,7 +243,7 @@ class EvalRSRunner:
                      items=self.dataset.df_tracks)
         # TODO: we should verify the shape of predictions respects top_k=20
         rlist = myRecList(model=model, dataset=dataset)
-        rlist.load_dense_repr(path_to_word_vectors=os.path.join(self.dataset.path_to_dataset,'song2vec.wv'))
+        rlist.load_dense_repr(path_to_word_vectors=os.path.join(self.dataset.path_to_dataset, 'song2vec.wv'))
         report_path = rlist()
         return report_path
 
@@ -250,37 +269,37 @@ class EvalRSRunner:
         """
         p1_score = np.mean(list(agg_test_results.values()))
         reference = PhaseOne()
-        
+
         # Check if submission meets minimum reqs
         if agg_test_results["HIT_RATE"] < reference.HR_THRESHOLD:
             return -100.0, p1_score
-        
+
         normalized_scores = dict()
         for test in LEADERBOARD_TESTS:
             normalized_scores[test] = (
-                agg_test_results[test] - reference.baseline[test]
-            ) / (reference.best[test] - reference.baseline[test])
+                                              agg_test_results[test] - reference.baseline[test]
+                                      ) / (reference.best[test] - reference.baseline[test])
 
         # Computing meta-scores
         # Performance
         ms_perf = (normalized_scores["HIT_RATE"] + normalized_scores["MRR"]) / 2
-        #Fairness / Slicing
+        # Fairness / Slicing
         ms_fair = (
-            normalized_scores["MRED_COUNTRY"] +
-            normalized_scores["MRED_USER_ACTIVITY"] +
-            normalized_scores["MRED_TRACK_POPULARITY"] +
-            normalized_scores["MRED_ARTIST_POPULARITY"] +
-            normalized_scores["MRED_GENDER"]
-        ) / 5
+                          normalized_scores["MRED_COUNTRY"] +
+                          normalized_scores["MRED_USER_ACTIVITY"] +
+                          normalized_scores["MRED_TRACK_POPULARITY"] +
+                          normalized_scores["MRED_ARTIST_POPULARITY"] +
+                          normalized_scores["MRED_GENDER"]
+                  ) / 5
         # Behavioral
         ms_behav = (
-            normalized_scores["BEING_LESS_WRONG"] + normalized_scores["LATENT_DIVERSITY"]
-        ) / 2
+                           normalized_scores["BEING_LESS_WRONG"] + normalized_scores["LATENT_DIVERSITY"]
+                   ) / 2
 
         # Meta-scores weights
         w = 1, 1.5, 1.5
         leaderboard_score = (w[0] * ms_perf + w[1] * ms_fair + w[2] * ms_behav) / sum(w)
-        
+
         return leaderboard_score, p1_score
 
     def evaluate(
@@ -293,7 +312,7 @@ class EvalRSRunner:
             debug=True,
             # these are additional arguments for training the model, if you need
             # to pass additional stuff
-            **kwargs 
+            **kwargs
     ):
         if debug:
             print('\nBegin Evaluation... ')
@@ -378,7 +397,7 @@ class EvalRSRunner:
                                   participant_id=self.participant_id,
                                   bucket_name=self.bucket_name)
         if debug:
-            time_for_submission = (time.time() - start)/60
+            time_for_submission = (time.time() - start) / 60
             print(f"Entire Process Duration: {time_for_submission} Minutes")
 
     def __hash__(self):
@@ -421,7 +440,7 @@ class PhaseOne:
         "MRED_TRACK_POPULARITY": -0.006816,
         "MRED_ARTIST_POPULARITY": -0.003915,
         "MRED_GENDER": -0.004354,
-        "BEING_LESS_WRONG": 0.2744871, # Original score (0.322926) decreased by 15%
+        "BEING_LESS_WRONG": 0.2744871,  # Original score (0.322926) decreased by 15%
         "LATENT_DIVERSITY": -0.324706
     }
 
